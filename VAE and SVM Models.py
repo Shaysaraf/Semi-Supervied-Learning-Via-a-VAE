@@ -1,35 +1,38 @@
 import torch
 from torchvision import datasets, transforms
-from torch import nn, optim
+from torch import nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
-from torch.autograd import Variable
-from datetime import datetime
+import matplotlib.pyplot as plt
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import StratifiedShuffleSplit
 import os
+import joblib
 
 # Hyperparameters
 IMG_SHAPE = [28, 28, 1]
 IMG_SIZE = 28 * 28
 INNER_SIZE = 600
 LATENT_DIM = 50
-LEARNING_RATE = 0.003
+LEARNING_RATE = 0.01
 BATCH_SIZE = 100
 N_EPOCHS = 30
-DROP_PROB = 0.2
-ALPHA = 0.05
-TRAIN = True
+DROP_PROB = 0.0
+ALPHA = 0.1
+TRAIN_VAE = False
+TRAIN_SVM = True
 MODEL_PATH = 'vae_checkpoint.pth'
+SVM_DIR = 'svm_models'
 
 # Device setup
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
 
 # Data loading
-train_set = datasets.FashionMNIST('~/.pytorch/F_MNIST_data/', download=True,
-                                  train=True, transform=transforms.ToTensor())
-test_set = datasets.FashionMNIST('~/.pytorch/F_MNIST_data/', download=True,
-                                 train=False, transform=transforms.ToTensor())
+transform = transforms.ToTensor()
+train_set = datasets.FashionMNIST('~/.pytorch/F_MNIST_data/', download=True, train=True, transform=transform)
+test_set = datasets.FashionMNIST('~/.pytorch/F_MNIST_data/', download=True, train=False, transform=transform)
 
 train_loader = torch.utils.data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False)
@@ -56,8 +59,8 @@ class Encoder(nn.Module):
         x = self.fc12(x)
         log_z_var = self.fc_var(x)
         z_mean = self.fc_mean(x)
-        std = log_z_var.mul(0.5).exp_()
-        epsilon = Variable(std.data.new(std.size()).normal_()).to(DEVICE)
+        std = torch.exp(0.5 * log_z_var)
+        epsilon = torch.randn_like(std)
         z = z_mean + std * epsilon
         return z, z_mean, log_z_var
 
@@ -92,9 +95,9 @@ class VAE(nn.Module):
         self.decoder = Decoder()
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight.data, 0, 0.001)
+                nn.init.normal_(m.weight, 0, 0.001)
                 if m.bias is not None:
-                    m.bias.data.zero_()
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         z, z_mean, log_z_var = self.encoder(x)
@@ -109,11 +112,9 @@ def train_model(model, optimizer, milestones, factor):
     for epoch in range(N_EPOCHS):
         running_loss = 0
         model.train()
-
         for images, _ in train_loader:
             images = images.to(DEVICE)
             optimizer.zero_grad()
-
             gener_x, z, z_mean, log_z_var = model(images)
             kl_loss = torch.mean(-0.5 * torch.sum(1 + log_z_var - z_mean.pow(2) - log_z_var.exp(), dim=1))
             BCE_loss = IMG_SIZE * F.binary_cross_entropy(gener_x.view(gener_x.size(0), -1),
@@ -121,14 +122,11 @@ def train_model(model, optimizer, milestones, factor):
             loss = ALPHA * kl_loss + BCE_loss
             loss.backward()
             optimizer.step()
-
             running_loss += loss.item()
 
         scheduler.step()
-        total_loss = running_loss / len(train_loader.dataset)
-        print(f"Epoch {epoch + 1}/{N_EPOCHS}, Training Loss: {total_loss:.3f}")
+        print(f"Epoch {epoch+1}/{N_EPOCHS}, Training Loss: {running_loss / len(train_loader.dataset):.3f}")
 
-    # Save model and optimizer state
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict()
@@ -139,8 +137,8 @@ def train_model(model, optimizer, milestones, factor):
 model = VAE().to(DEVICE)
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# Train or load
-if TRAIN:
+# Train or Load
+if TRAIN_VAE:
     train_model(model, optimizer, milestones=[20], factor=10)
 else:
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
@@ -148,12 +146,11 @@ else:
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     print(f"Model loaded from {MODEL_PATH}")
 
-# Generation
+# Generate Digits
 model.eval()
 n = 10
 digit_size = 28
 figure = np.zeros((digit_size * n, digit_size * n))
-
 with torch.no_grad():
     for j in range(n):
         for i in range(n):
@@ -167,3 +164,41 @@ plt.figure(figsize=(10, 10))
 plt.imshow(figure, cmap='gray')
 plt.axis('off')
 plt.show()
+
+# SVM Classification
+x_train = train_set.data.float().view(-1, 28, 28, 1) / 255.
+y_train = train_set.targets.numpy()
+x_test = test_set.data.float().view(-1, 28, 28, 1) / 255.
+y_test = test_set.targets.numpy()
+
+vae_model = VAE().to(DEVICE)
+vae_model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE)['model_state_dict'])
+vae_model.eval()
+
+# Create directory for SVM models
+os.makedirs(SVM_DIR, exist_ok=True)
+
+for sample_size in [100, 600, 1000, 3000]:
+    print(f"\nSample size: {sample_size}")
+    sss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=222)
+    for train_idx, _ in sss.split(x_train, y_train):
+        x_sample = x_train[train_idx].permute(0, 3, 1, 2).to(DEVICE)  # (B, 1, 28, 28)
+        y_sample = y_train[train_idx]
+
+    if TRAIN_SVM:
+        with torch.no_grad():
+            z_sample, _, _ = vae_model.encoder(x_sample)
+        z_sample = z_sample.cpu().numpy()
+        svm_model = SVC()
+        svm_model.fit(z_sample, y_sample)
+        joblib.dump(svm_model, os.path.join(SVM_DIR, f'SVM_{sample_size}.sav'))
+    else:
+        svm_model = joblib.load(os.path.join(SVM_DIR, f'SVM_{sample_size}.sav'))
+
+    with torch.no_grad():
+        x_test_input = x_test.permute(0, 3, 1, 2).to(DEVICE)
+        z_test, _, _ = vae_model.encoder(x_test_input)
+    z_test = z_test.cpu().numpy()
+    y_pred = svm_model.predict(z_test)
+    acc = accuracy_score(y_test, y_pred)
+    print(f"SVM Accuracy with {sample_size} samples: {acc * 100:.2f}%")
