@@ -189,7 +189,7 @@ for sample_size in [100, 600, 1000, 3000]:
         with torch.no_grad():
             z_sample, _, _ = vae_model.encoder(x_sample)
         z_sample = z_sample.cpu().numpy()
-        svm_model = SVC()
+        svm_model = SVC(kernel='rbf', C=1.5, gamma='scale')
         svm_model.fit(z_sample, y_sample)
         joblib.dump(svm_model, os.path.join(SVM_DIR, f'SVM_{sample_size}.sav'))
     else:
