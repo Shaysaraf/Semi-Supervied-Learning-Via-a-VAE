@@ -1,78 +1,77 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Fix Intel OpenMP runtime conflict
-
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-import numpy as np
-import time
+
+# Ensure CPU compatibility and avoid multiprocessing slowdown
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # Device
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('cpu')
 print(f"Using device: {DEVICE}")
 
 # Hyperparameters
 Z_DIM = 100
 BATCH_SIZE = 64
-N_CRITIC = 10
+N_CRITIC = 5
 LAMBDA_GP = 10
-LR = 5e-5
+LR = 1e-4
 BETA1 = 0.0
 BETA2 = 0.9
-MAX_EPOCHS = 25
-IMAGE_SIZE = 28
+MAX_EPOCHS = 40
 
-# Early stopping parameters
-LOSS_WINDOW = 5
-MIN_EPOCHS = 10
-EARLY_STOP_THRESHOLD = 1e-4
-
-# Data
+# DataLoader
 transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize((0.5,), (0.5,))
 ])
-train_set = datasets.FashionMNIST(root='~/.pytorch/F_MNIST_data/', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+train_data = datasets.FashionMNIST(root='./data', train=True, transform=transform, download=True)
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
 # Generator
 class Generator(nn.Module):
     def __init__(self, z_dim):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(z_dim, 256 * 7 * 7),
-            nn.BatchNorm1d(256 * 7 * 7),
-            nn.ReLU(True),
-            nn.Unflatten(1, (256, 7, 7)),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 1, 4, 2, 1),
+            nn.Linear(z_dim, 128 * 7 * 7),
+            nn.ReLU(inplace=False),
+            nn.Unflatten(1, (128, 7, 7)),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=False),
+            nn.ConvTranspose2d(64, 1, 4, 2, 1),
             nn.Tanh()
         )
 
     def forward(self, z):
         return self.model(z)
 
-# Critic with InstanceNorm2d
+# Critic
 class Critic(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = nn.Sequential(
             nn.Conv2d(1, 64, 4, 2, 1),
-            nn.LeakyReLU(0.2),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(64, 128, 4, 2, 1),
-            nn.InstanceNorm2d(128, affine=True),
-            nn.LeakyReLU(0.2),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Flatten(),
             nn.Linear(128 * 7 * 7, 1)
         )
 
     def forward(self, x):
         return self.model(x)
+
+# Weight Init
+def weights_init(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 
 # Gradient Penalty
 def compute_gradient_penalty(D, real_samples, fake_samples):
@@ -94,24 +93,34 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
 # Initialize models
 G = Generator(Z_DIM).to(DEVICE)
 D = Critic().to(DEVICE)
+G.apply(weights_init)
+D.apply(weights_init)
+
 opt_G = optim.Adam(G.parameters(), lr=LR, betas=(BETA1, BETA2))
 opt_D = optim.Adam(D.parameters(), lr=LR, betas=(BETA1, BETA2))
 
-# Training loop
-g_losses, d_losses, prev_d_losses = [], [], []
+g_losses, d_losses = [], []
 
-print("Training WGAN-GP...\n")
-total_start_time = time.time()
+print("Starting WGAN-GP Training...\n")
+start_time = time.time()
 
 for epoch in range(MAX_EPOCHS):
-    epoch_start_time = time.time()
+    epoch_start = time.time()
+    data_iter = iter(train_loader)
+    i = 0
 
-    for i, (real_imgs, _) in enumerate(train_loader):
-        real_imgs = real_imgs.to(DEVICE)
-        batch_size = real_imgs.size(0)
-
-        # Train Critic
+    while i < len(train_loader):
         for _ in range(N_CRITIC):
+            try:
+                real_imgs, _ = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                real_imgs, _ = next(data_iter)
+
+            i += 1
+            real_imgs = real_imgs.to(DEVICE)
+            batch_size = real_imgs.size(0)
+
             z = torch.randn(batch_size, Z_DIM, device=DEVICE)
             fake_imgs = G(z).detach()
 
@@ -125,7 +134,7 @@ for epoch in range(MAX_EPOCHS):
             d_loss.backward()
             opt_D.step()
 
-        # Train Generator
+        # Generator update
         z = torch.randn(batch_size, Z_DIM, device=DEVICE)
         gen_imgs = G(z)
         g_loss = -torch.mean(D(gen_imgs))
@@ -134,44 +143,29 @@ for epoch in range(MAX_EPOCHS):
         g_loss.backward()
         opt_G.step()
 
-    d_losses.append(d_loss.item())
-    g_losses.append(g_loss.item())
+        g_losses.append(g_loss.item())
+        d_losses.append(d_loss.item())
 
-    # Progress
-    epoch_time = time.time() - epoch_start_time
-    print(f"Epoch {epoch+1}/{MAX_EPOCHS} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f} | "
-          f"Time: {epoch_time:.1f}s")
+    epoch_duration = time.time() - epoch_start
+    print(f"Epoch {epoch+1}/{MAX_EPOCHS} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f} | Time: {epoch_duration:.1f}s")
 
-    # Early stopping check
-    prev_d_losses.append(d_loss.item())
-    if len(prev_d_losses) > LOSS_WINDOW:
-        prev_d_losses.pop(0)
-        delta = np.abs(np.mean(np.diff(prev_d_losses)))
-        if delta < EARLY_STOP_THRESHOLD and epoch + 1 >= MIN_EPOCHS:
-            print(f"\nEarly stopping at epoch {epoch+1}. ΔLoss: {delta:.6f}")
-            break
-
-# Final stats
-total_time = time.time() - total_start_time
-print(f"\nTraining complete in {total_time:.1f}s ({total_time/60:.1f} minutes)")
-
-# Plot loss
-plt.plot(d_losses, label="Critic Loss")
-plt.plot(g_losses, label="Generator Loss")
-plt.title("WGAN-GP Losses")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
+# Loss plot
+plt.plot(d_losses, label='Critic Loss')
+plt.plot(g_losses, label='Generator Loss')
+plt.title('WGAN-GP Training Loss')
+plt.xlabel('Iterations')
+plt.ylabel('Loss')
 plt.legend()
 plt.grid()
 plt.show()
 
-# Generate and show images
+# Show samples
 def show_generated(generator, n=5):
     generator.eval()
     z = torch.randn(n, Z_DIM, device=DEVICE)
     with torch.no_grad():
         imgs = generator(z).cpu()
-    imgs = imgs * 0.5 + 0.5  # Denormalize
+    imgs = imgs * 0.5 + 0.5
     fig, axs = plt.subplots(1, n, figsize=(n * 2, 2))
     for i in range(n):
         axs[i].imshow(imgs[i].squeeze(), cmap='gray')
@@ -179,16 +173,4 @@ def show_generated(generator, n=5):
     plt.suptitle("Generated Images (WGAN-GP)")
     plt.show()
 
-def show_real_images():
-    real_imgs, _ = next(iter(train_loader))
-    real_imgs = real_imgs[:5] * 0.5 + 0.5
-    fig, axs = plt.subplots(1, 5, figsize=(10, 2))
-    for i in range(5):
-        axs[i].imshow(real_imgs[i].squeeze(), cmap='gray')
-        axs[i].axis('off')
-    plt.suptitle("Real Fashion MNIST Images")
-    plt.show()
-
-# Display final results
-show_real_images()
-show_generated(G, n=5)
+show_generated(G)
