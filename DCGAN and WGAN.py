@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 # Ensure CPU compatibility and avoid multiprocessing slowdown
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+# Flag to control training or loading
+TRAIN_MODEL_WGAN = True  # Set to False to load pre-trained models
+
 # Device
 DEVICE = torch.device('cpu')
 print(f"Using device: {DEVICE}")
@@ -22,7 +25,7 @@ LAMBDA_GP = 10
 LR = 1e-4
 BETA1 = 0.0
 BETA2 = 0.9
-MAX_EPOCHS = 40
+MAX_EPOCHS = 100
 
 # DataLoader
 transform = transforms.Compose([
@@ -30,7 +33,7 @@ transform = transforms.Compose([
     transforms.Normalize((0.5,), (0.5,))
 ])
 train_data = datasets.FashionMNIST(root='./data', train=True, transform=transform, download=True)
-train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)  # Set num_workers=0 for Windows
 
 # Generator
 class Generator(nn.Module):
@@ -93,71 +96,92 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
 # Initialize models
 G = Generator(Z_DIM).to(DEVICE)
 D = Critic().to(DEVICE)
-G.apply(weights_init)
-D.apply(weights_init)
+
+# Create directory for saving models
+os.makedirs('models', exist_ok=True)
+GENERATOR_PATH = 'models/generator.pth'
+CRITIC_PATH = 'models/critic.pth'
+
+if TRAIN_MODEL_WGAN:
+    G.apply(weights_init)
+    D.apply(weights_init)
+else:
+    try:
+        G.load_state_dict(torch.load(GENERATOR_PATH, map_location=DEVICE))
+        D.load_state_dict(torch.load(CRITIC_PATH, map_location=DEVICE))
+        print(f"Loaded pre-trained models from {GENERATOR_PATH} and {CRITIC_PATH}")
+    except FileNotFoundError:
+        print("Pre-trained model files not found. Please train the model first by setting TRAIN_MODEL_WGAN=True.")
+        exit(1)
 
 opt_G = optim.Adam(G.parameters(), lr=LR, betas=(BETA1, BETA2))
 opt_D = optim.Adam(D.parameters(), lr=LR, betas=(BETA1, BETA2))
 
 g_losses, d_losses = [], []
 
-print("Starting WGAN-GP Training...\n")
-start_time = time.time()
+def train_wgan():
+    print("Starting WGAN-GP Training...\n")
+    start_time = time.time()
 
-for epoch in range(MAX_EPOCHS):
-    epoch_start = time.time()
-    data_iter = iter(train_loader)
-    i = 0
+    for epoch in range(MAX_EPOCHS):
+        epoch_start = time.time()
+        data_iter = iter(train_loader)
+        i = 0
 
-    while i < len(train_loader):
-        for _ in range(N_CRITIC):
-            try:
-                real_imgs, _ = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                real_imgs, _ = next(data_iter)
+        while i < len(train_loader):
+            for _ in range(N_CRITIC):
+                try:
+                    real_imgs, _ = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    real_imgs, _ = next(data_iter)
 
-            i += 1
-            real_imgs = real_imgs.to(DEVICE)
-            batch_size = real_imgs.size(0)
+                i += 1
+                real_imgs = real_imgs.to(DEVICE)
+                batch_size = real_imgs.size(0)
 
+                z = torch.randn(batch_size, Z_DIM, device=DEVICE)
+                fake_imgs = G(z).detach()
+
+                real_validity = D(real_imgs)
+                fake_validity = D(fake_imgs)
+                gp = compute_gradient_penalty(D, real_imgs, fake_imgs)
+
+                d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + LAMBDA_GP * gp
+
+                opt_D.zero_grad()
+                d_loss.backward()
+                opt_D.step()
+
+            # Generator update
             z = torch.randn(batch_size, Z_DIM, device=DEVICE)
-            fake_imgs = G(z).detach()
+            gen_imgs = G(z)
+            g_loss = -torch.mean(D(gen_imgs))
 
-            real_validity = D(real_imgs)
-            fake_validity = D(fake_imgs)
-            gp = compute_gradient_penalty(D, real_imgs, fake_imgs)
+            opt_G.zero_grad()
+            g_loss.backward()
+            opt_G.step()
 
-            d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + LAMBDA_GP * gp
+            g_losses.append(g_loss.item())
+            d_losses.append(d_loss.item())
 
-            opt_D.zero_grad()
-            d_loss.backward()
-            opt_D.step()
+        epoch_duration = time.time() - epoch_start
+        print(f"Epoch {epoch+1}/{MAX_EPOCHS} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f} | Time: {epoch_duration:.1f}s")
 
-        # Generator update
-        z = torch.randn(batch_size, Z_DIM, device=DEVICE)
-        gen_imgs = G(z)
-        g_loss = -torch.mean(D(gen_imgs))
+    # Save the trained models
+    torch.save(G.state_dict(), GENERATOR_PATH)
+    torch.save(D.state_dict(), CRITIC_PATH)
+    print(f"Saved trained models to {GENERATOR_PATH} and {CRITIC_PATH}")
 
-        opt_G.zero_grad()
-        g_loss.backward()
-        opt_G.step()
-
-        g_losses.append(g_loss.item())
-        d_losses.append(d_loss.item())
-
-    epoch_duration = time.time() - epoch_start
-    print(f"Epoch {epoch+1}/{MAX_EPOCHS} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f} | Time: {epoch_duration:.1f}s")
-
-# Loss plot
-plt.plot(d_losses, label='Critic Loss')
-plt.plot(g_losses, label='Generator Loss')
-plt.title('WGAN-GP Training Loss')
-plt.xlabel('Iterations')
-plt.ylabel('Loss')
-plt.legend()
-plt.grid()
-plt.show()
+    # Loss plot
+    plt.plot(d_losses, label='Critic Loss')
+    plt.plot(g_losses, label='Generator Loss')
+    plt.title('WGAN-GP Training Loss')
+    plt.xlabel('Iterations')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid()
+    plt.show()
 
 # Show samples
 def show_generated(generator, n=5):
@@ -173,4 +197,7 @@ def show_generated(generator, n=5):
     plt.suptitle("Generated Images (WGAN-GP)")
     plt.show()
 
-show_generated(G)
+if __name__ == '__main__':
+    if TRAIN_MODEL_WGAN:
+        train_wgan()
+    show_generated(G)
