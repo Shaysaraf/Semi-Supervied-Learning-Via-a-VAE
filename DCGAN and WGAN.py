@@ -1,203 +1,240 @@
 import os
-import time
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
-
-# Ensure CPU compatibility and avoid multiprocessing slowdown
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import torch
+from torch import nn
+from torchvision.datasets import FashionMNIST
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm.auto import tqdm
+import time
 
-# Flag to control training or loading
-TRAIN_MODEL_WGAN = True  # Set to False to load pre-trained models
+# ========== Flags ==========
+TRAIN_WGAN = True
+TRAIN_DCGAN = True
 
-# Device
-DEVICE = torch.device('cpu')
-print(f"Using device: {DEVICE}")
+# ========== Config ==========
+SAVE_DIR = "models_combined"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Hyperparameters
-Z_DIM = 100
-BATCH_SIZE = 64
-N_CRITIC = 5
-LAMBDA_GP = 10
-LR = 1e-4
-BETA1 = 0.0
-BETA2 = 0.9
-MAX_EPOCHS = 100
+device     = 'cuda' if torch.cuda.is_available() else 'cpu'
+batch_size = 128
+image_size = 64
+z_dim      = 64
+nc         = 1
+lr         = 0.0002
+beta_1     = 0.5
+beta_2     = 0.999
+epochs     = 150
+clip_value = 0.01
 
-# DataLoader
+# ========== Dataset ==========
 transform = transforms.Compose([
+    transforms.Resize(image_size),
     transforms.ToTensor(),
     transforms.Normalize((0.5,), (0.5,))
 ])
-train_data = datasets.FashionMNIST(root='./data', train=True, transform=transform, download=True)
-train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)  # Set num_workers=0 for Windows
+dataloader = DataLoader(
+    FashionMNIST(".", download=True, transform=transform),
+    batch_size=batch_size,
+    shuffle=True
+)
 
-# Generator
+# ========== Models ==========
 class Generator(nn.Module):
-    def __init__(self, z_dim):
+    def __init__(self, z_dim, nc=1, hidden_channels=64):
         super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(z_dim, 128 * 7 * 7),
-            nn.ReLU(inplace=False),
-            nn.Unflatten(1, (128, 7, 7)),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=False),
-            nn.ConvTranspose2d(64, 1, 4, 2, 1),
+        self.z_dim = z_dim
+        self.gen = nn.Sequential(
+            self.block(z_dim, hidden_channels * 8, 4, 1, 0),
+            self.block(hidden_channels * 8, hidden_channels * 4),
+            self.block(hidden_channels * 4, hidden_channels * 2),
+            self.block(hidden_channels * 2, hidden_channels),
+            nn.ConvTranspose2d(hidden_channels, nc, 4, 2, 1),
             nn.Tanh()
         )
 
-    def forward(self, z):
-        return self.model(z)
-
-# Critic
-class Critic(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(1, 64, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Conv2d(64, 128, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Flatten(),
-            nn.Linear(128 * 7 * 7, 1)
+    def block(self, in_c, out_c, k=4, s=2, p=1):
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_c, out_c, k, s, p, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(True)
         )
 
     def forward(self, x):
-        return self.model(x)
+        x = x.view(len(x), self.z_dim, 1, 1)
+        return self.gen(x)
 
-# Weight Init
+class Critic(nn.Module):
+    def __init__(self, nc=1, hidden_channels=64):
+        super().__init__()
+        self.crt = nn.Sequential(
+            nn.Conv2d(nc, hidden_channels, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            self.block(hidden_channels, hidden_channels * 2),
+            self.block(hidden_channels * 2, hidden_channels * 4),
+            self.block(hidden_channels * 4, hidden_channels * 8),
+            nn.Conv2d(hidden_channels * 8, 1, 4, 1, 0)
+        )
+
+    def block(self, in_c, out_c, k=4, s=2, p=1):
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, k, s, p),
+            nn.BatchNorm2d(out_c),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+    def forward(self, x):
+        return self.crt(x).view(len(x), -1)
+
+class Discriminator(nn.Module):
+    def __init__(self, nc=1, hidden_channels=64):
+        super().__init__()
+        self.disc = nn.Sequential(
+            nn.Conv2d(nc, hidden_channels, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            self.block(hidden_channels, hidden_channels * 2),
+            self.block(hidden_channels * 2, hidden_channels * 4),
+            self.block(hidden_channels * 4, hidden_channels * 8),
+            nn.Conv2d(hidden_channels * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def block(self, in_c, out_c, k=4, s=2, p=1):
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, k, s, p, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+    def forward(self, x):
+        return self.disc(x).view(-1)
+
+# ========== Utilities ==========
 def weights_init(m):
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
         nn.init.normal_(m.weight, 0.0, 0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
+    if isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+        nn.init.constant_(m.bias, 0)
 
-# Gradient Penalty
-def compute_gradient_penalty(D, real_samples, fake_samples):
-    alpha = torch.rand(real_samples.size(0), 1, 1, 1, device=DEVICE)
-    interpolates = alpha * real_samples + (1 - alpha) * fake_samples
-    interpolates.requires_grad_(True)
-    d_interpolates = D(interpolates)
-    gradients = torch.autograd.grad(
-        outputs=d_interpolates,
-        inputs=interpolates,
-        grad_outputs=torch.ones_like(d_interpolates),
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True
-    )[0]
-    gradients = gradients.view(gradients.size(0), -1)
-    return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-
-# Initialize models
-G = Generator(Z_DIM).to(DEVICE)
-D = Critic().to(DEVICE)
-
-# Create directory for saving models
-os.makedirs('models', exist_ok=True)
-GENERATOR_PATH = 'models/generator.pth'
-CRITIC_PATH = 'models/critic.pth'
-
-if TRAIN_MODEL_WGAN:
-    G.apply(weights_init)
-    D.apply(weights_init)
-else:
-    try:
-        G.load_state_dict(torch.load(GENERATOR_PATH, map_location=DEVICE))
-        D.load_state_dict(torch.load(CRITIC_PATH, map_location=DEVICE))
-        print(f"Loaded pre-trained models from {GENERATOR_PATH} and {CRITIC_PATH}")
-    except FileNotFoundError:
-        print("Pre-trained model files not found. Please train the model first by setting TRAIN_MODEL_WGAN=True.")
-        exit(1)
-
-opt_G = optim.Adam(G.parameters(), lr=LR, betas=(BETA1, BETA2))
-opt_D = optim.Adam(D.parameters(), lr=LR, betas=(BETA1, BETA2))
-
-g_losses, d_losses = [], []
-
-def train_wgan():
-    print("Starting WGAN-GP Training...\n")
-    start_time = time.time()
-
-    for epoch in range(MAX_EPOCHS):
-        epoch_start = time.time()
-        data_iter = iter(train_loader)
-        i = 0
-
-        while i < len(train_loader):
-            for _ in range(N_CRITIC):
-                try:
-                    real_imgs, _ = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(train_loader)
-                    real_imgs, _ = next(data_iter)
-
-                i += 1
-                real_imgs = real_imgs.to(DEVICE)
-                batch_size = real_imgs.size(0)
-
-                z = torch.randn(batch_size, Z_DIM, device=DEVICE)
-                fake_imgs = G(z).detach()
-
-                real_validity = D(real_imgs)
-                fake_validity = D(fake_imgs)
-                gp = compute_gradient_penalty(D, real_imgs, fake_imgs)
-
-                d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + LAMBDA_GP * gp
-
-                opt_D.zero_grad()
-                d_loss.backward()
-                opt_D.step()
-
-            # Generator update
-            z = torch.randn(batch_size, Z_DIM, device=DEVICE)
-            gen_imgs = G(z)
-            g_loss = -torch.mean(D(gen_imgs))
-
-            opt_G.zero_grad()
-            g_loss.backward()
-            opt_G.step()
-
-            g_losses.append(g_loss.item())
-            d_losses.append(d_loss.item())
-
-        epoch_duration = time.time() - epoch_start
-        print(f"Epoch {epoch+1}/{MAX_EPOCHS} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f} | Time: {epoch_duration:.1f}s")
-
-    # Save the trained models
-    torch.save(G.state_dict(), GENERATOR_PATH)
-    torch.save(D.state_dict(), CRITIC_PATH)
-    print(f"Saved trained models to {GENERATOR_PATH} and {CRITIC_PATH}")
-
-    # Loss plot
-    plt.plot(d_losses, label='Critic Loss')
-    plt.plot(g_losses, label='Generator Loss')
-    plt.title('WGAN-GP Training Loss')
-    plt.xlabel('Iterations')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid()
-    plt.show()
-
-# Show samples
-def show_generated(generator, n=5):
+def show_images(generator, z_dim, epoch, title="Generated Samples"):
     generator.eval()
-    z = torch.randn(n, Z_DIM, device=DEVICE)
     with torch.no_grad():
-        imgs = generator(z).cpu()
-    imgs = imgs * 0.5 + 0.5
-    fig, axs = plt.subplots(1, n, figsize=(n * 2, 2))
-    for i in range(n):
-        axs[i].imshow(imgs[i].squeeze(), cmap='gray')
-        axs[i].axis('off')
-    plt.suptitle("Generated Images (WGAN-GP)")
+        noise = torch.randn(16, z_dim, device=device)
+        samples = generator(noise).detach().cpu()
+        grid = vutils.make_grid(samples, nrow=4, normalize=True)
+        plt.figure(figsize=(6, 6))
+        plt.axis("off")
+        plt.title(f"{title} (Epoch {epoch})")
+        plt.imshow(np.transpose(grid, (1, 2, 0)))
+        plt.show()
+
+def plot_losses(d_losses, g_losses, title):
+    plt.figure(figsize=(10, 5))
+    plt.plot(g_losses, label='Generator Loss', color='blue')
+    plt.plot(d_losses, label='Critic/Discriminator Loss', color='red')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
     plt.show()
 
-if __name__ == '__main__':
-    if TRAIN_MODEL_WGAN:
-        train_wgan()
-    show_generated(G)
+# ========== WGAN Training ==========
+if TRAIN_WGAN:
+    print("\n Starting WGAN Training")
+    gen = Generator(z_dim).to(device)
+    crt = Critic(nc).to(device)
+    gen.apply(weights_init)
+    crt.apply(weights_init)
+
+    gen_opt = torch.optim.Adam(gen.parameters(), lr=lr, betas=(beta_1, beta_2))
+    crt_opt = torch.optim.Adam(crt.parameters(), lr=lr, betas=(beta_1, beta_2))
+
+    gen_losses, crt_losses = [], []
+
+    for epoch in range(epochs):
+        g_total, c_total = 0, 0
+        for real, _ in tqdm(dataloader, desc=f"[WGAN Epoch {epoch+1}]"):
+            real = real.to(device)
+            batch_size = real.size(0)
+            noise = torch.randn(batch_size, z_dim, device=device)
+
+            # Train Critic
+            fake = gen(noise)
+            crt_opt.zero_grad()
+            loss_c = torch.mean(crt(fake.detach())) - torch.mean(crt(real))
+            loss_c.backward()
+            crt_opt.step()
+            for p in crt.parameters():
+                p.data.clamp_(-clip_value, clip_value)
+            c_total += loss_c.item()
+
+            # Train Generator
+            gen_opt.zero_grad()
+            fake = gen(noise)
+            loss_g = -torch.mean(crt(fake))
+            loss_g.backward()
+            gen_opt.step()
+            g_total += loss_g.item()
+
+        crt_losses.append(c_total / len(dataloader))
+        gen_losses.append(g_total / len(dataloader))
+        print(f" Epoch {epoch+1}/{epochs} | Gen Loss: {gen_losses[-1]:.4f} | Critic Loss: {crt_losses[-1]:.4f}")
+        show_images(gen, z_dim, epoch+1, title="WGAN Samples")
+
+    plot_losses(crt_losses, gen_losses, "WGAN Losses")
+    torch.save(gen.state_dict(), os.path.join(SAVE_DIR, "wgan_gen.pth"))
+    torch.save(crt.state_dict(), os.path.join(SAVE_DIR, "wgan_crt.pth"))
+
+# ========== DCGAN Training ==========
+if TRAIN_DCGAN:
+    print("\n Starting DCGAN Training")
+    gen = Generator(z_dim).to(device)
+    disc = Discriminator(nc).to(device)
+    gen.apply(weights_init)
+    disc.apply(weights_init)
+
+    criterion = nn.BCELoss()
+    gen_opt = torch.optim.Adam(gen.parameters(), lr=lr, betas=(beta_1, beta_2))
+    disc_opt = torch.optim.Adam(disc.parameters(), lr=lr, betas=(beta_1, beta_2))
+
+    gen_losses, disc_losses = [], []
+
+    for epoch in range(epochs):
+        g_total, d_total = 0, 0
+        for real, _ in tqdm(dataloader, desc=f"[DCGAN Epoch {epoch+1}]"):
+            real = real.to(device)
+            batch_size = real.size(0)
+            noise = torch.randn(batch_size, z_dim, device=device)
+            fake = gen(noise)
+
+            # Train Discriminator
+            disc_opt.zero_grad()
+            real_loss = criterion(disc(real), torch.ones(batch_size, device=device))
+            fake_loss = criterion(disc(fake.detach()), torch.zeros(batch_size, device=device))
+            loss_d = real_loss + fake_loss
+            loss_d.backward()
+            disc_opt.step()
+            d_total += loss_d.item()
+
+            # Train Generator
+            gen_opt.zero_grad()
+            fake = gen(noise)
+            loss_g = criterion(disc(fake), torch.ones(batch_size, device=device))
+            loss_g.backward()
+            gen_opt.step()
+            g_total += loss_g.item()
+
+        disc_losses.append(d_total / len(dataloader))
+        gen_losses.append(g_total / len(dataloader))
+        print(f" Epoch {epoch+1}/{epochs} | Gen Loss: {gen_losses[-1]:.4f} | Disc Loss: {disc_losses[-1]:.4f}")
+        show_images(gen, z_dim, epoch+1, title="DCGAN Samples")
+
+    plot_losses(disc_losses, gen_losses, "DCGAN Losses")
+    torch.save(gen.state_dict(), os.path.join(SAVE_DIR, "dcgan_gen.pth"))
+    torch.save(disc.state_dict(), os.path.join(SAVE_DIR, "dcgan_disc.pth"))
